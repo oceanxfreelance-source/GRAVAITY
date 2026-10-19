@@ -112,6 +112,7 @@ input double          InpMartMaxRisk = 70.0;       // Max risk % for a martingal
 //--- Display
 input group "Display"
 input bool            InpShowPanel   = true;       // Show info panel
+input bool            InpDebugLog    = false;      // Print the signal checklist every bar (Experts tab)
 
 //--- globals
 CTrade   trade;
@@ -129,6 +130,7 @@ double   dayStartEq    = 0;
 int      dayTrades     = 0;
 string   gvMart;
 string   panelTrend = "-", panelSession = "-", panelNote = "";
+string   panelBuy = "waiting for first closed bar", panelSell = "", panelGuards = "";
 double   panelAdx = 0;
 
 const int BARS = 600;
@@ -223,11 +225,17 @@ void OnNewBar()
    double emaF[], emaS[], emaT[], e12[], e26[], rsi[], adx[], pdi[], mdi[];
    ArraySetAsSeries(r, false);
    if(CopyRates(_Symbol, InpTF, 1, BARS, r) != BARS)
+     {
+      panelBuy = "loading price history (need 600 bars of " + EnumToString(InpTF) + ")";
       return;
+     }
    if(!CopyClosed(hEmaF, 0, emaF) || !CopyClosed(hEmaS, 0, emaS) || !CopyClosed(hEmaT, 0, emaT) ||
       !CopyClosed(hEma12, 0, e12) || !CopyClosed(hEma26, 0, e26) || !CopyClosed(hRsi, 0, rsi) ||
       !CopyClosed(hAdx, 0, adx) || !CopyClosed(hAdx, 1, pdi) || !CopyClosed(hAdx, 2, mdi))
+     {
+      panelBuy = "indicators still loading";
       return;
+     }
 
    int n = BARS - 1; // index of the last closed bar (the signal bar)
 
@@ -254,7 +262,10 @@ void OnNewBar()
       int hs = iBarShift(_Symbol, InpHtfTF, r[n].time) + 1;
       double hc[], he[];
       if(CopyClose(_Symbol, InpHtfTF, hs, 1, hc) != 1 || CopyBuffer(hHtfEma, 0, hs, 1, he) != 1)
+        {
+         panelBuy = "loading " + EnumToString(InpHtfTF) + " data";
          return;
+        }
       htfUp = hc[0] > he[0];
       htfDn = hc[0] < he[0];
      }
@@ -325,10 +336,24 @@ void OnNewBar()
 
    bool longSig  = InpDirection != DIR_SHORT && trendUp && strongUp && pbL && trigL && rsiL;
    bool shortSig = InpDirection != DIR_LONG  && trendDn && strongDn && pbS && trigS && rsiS;
+   //--- checklist for the panel / log: shows which condition blocks a trade
+   panelBuy  = "BUY  " + Chk("trend", trendUp) + Chk("ADX/DI", strongUp) + Chk("pullback", pbL) +
+               Chk("trigger", trigL) + StringFormat("RSI %.0f ", rsi[n]) + Chk("", rsiL);
+   panelSell = "SELL " + Chk("trend", trendDn) + Chk("ADX/DI", strongDn) + Chk("pullback", pbS) +
+               Chk("trigger", trigS) + StringFormat("RSI %.0f ", rsi[n]) + Chk("", rsiS);
+   panelGuards = Chk("session", inSession) + Chk("volume", volOk) + Chk("cooldown", cooldownOk) +
+                 Chk("daily limit", dayOk) + Chk("spread", spreadOk) + Chk("algo trading", TradingAllowed());
+   if(InpDebugLog)
+      Print(TimeToString(r[n].time), " | ", panelBuy, " | ", panelSell, " | ", panelGuards);
+
    if(!(longSig || shortSig))
       return;
    if(!(cooldownOk && inSession && dayOk && volOk && spreadOk))
+     {
+      panelNote = "Signal on " + TimeToString(r[n].time) + " blocked by a guard (see Checks)";
+      Print(panelNote, " | ", panelGuards);
       return;
+     }
 
    //--- position size
    double lots, riskPct;
@@ -336,6 +361,18 @@ void OnNewBar()
       return;
 
    OpenTrade(longSig, lots, riskPct);
+  }
+
+//+------------------------------------------------------------------+
+string Chk(string name, bool ok)
+  {
+   return name + (ok ? "[ok] " : "[x] ");
+  }
+
+bool TradingAllowed()
+  {
+   return TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) &&
+          AccountInfoInteger(ACCOUNT_TRADE_EXPERT) && AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
   }
 
 //+------------------------------------------------------------------+
@@ -656,6 +693,12 @@ void DrawPanel()
    s += StringFormat("Martingale: %s\n", InpUseMart ? StringFormat("step %d / %d (x%.2f)", martLevel, InpMartSteps, MathPow(InpMartMult, martLevel)) : "OFF");
    s += StringFormat("Trend %s   Session %s   ADX %.1f\n", panelTrend, panelSession, panelAdx);
    s += StringFormat("SL %.2f / TP %.2f (price)  BE %s   Risk %.1f%%\n", gSl, gTp, gUseBE ? "on" : "off", InpRiskPct);
+   s += "Last closed bar checks (all [ok] = trade):\n";
+   s += "  " + panelBuy + "\n";
+   s += "  " + panelSell + "\n";
+   s += "  Checks: " + panelGuards + "\n";
+   if(!TradingAllowed())
+      s += "!! Algo trading is OFF (toolbar button or EA settings > Common > Allow Algo Trading)\n";
    if(panelNote != "")
       s += panelNote + "\n";
    Comment(s);
