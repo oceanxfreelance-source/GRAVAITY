@@ -5,12 +5,12 @@
 //|  Logic (evaluated once per closed bar, default M5):              |
 //|  - Trend: close vs EMA200, EMA9 > EMA21, Supertrend(3,10),       |
 //|    M15 close vs M15 EMA50 (previous closed M15 bar)              |
-//|  - Strength: ADX(14, Wilder) > 26 with matching +DI / -DI        |
+//|  - Strength: ADX(14, Wilder) > 23 with matching +DI / -DI        |
 //|  - Pullback: low touched EMA21 within the last 5 bars            |
 //|  - Trigger: candle closes beyond EMA9 and the previous high/low  |
 //|    (or MACD histogram crosses zero)                              |
 //|  - RSI 50-72 for buys, 28-50 for sells, tick volume > average    |
-//|  - London / New York session only (07:00-17:00 UTC)              |
+//|  - Trades 24h by default (optional 07:00-17:00 UTC session)     |
 //|  - Exit profiles (price distance, USD per oz):                    |
 //|      Big profit (default): SL 4, TP 6, break-even at +2.5        |
 //|      High win rate: SL 4, TP 2      Big reward: SL 4, TP 8       |
@@ -70,7 +70,7 @@ input double          InpRsiLongMax  = 72;         // RSI long max
 input double          InpRsiShortMax = 50;         // RSI short max
 input double          InpRsiShortMin = 28;         // RSI short min
 input int             InpAdxLen      = 14;         // ADX length
-input double          InpAdxMin      = 26;         // ADX minimum
+input double          InpAdxMin      = 23;         // ADX minimum
 input int             InpPullbackBars= 5;          // Pullback lookback (bars)
 input bool            InpUseVol      = true;       // Tick-volume filter
 input int             InpVolLen      = 20;         // Volume MA length
@@ -79,7 +79,7 @@ input int             InpCooldown    = 3;          // Cooldown bars after exit
 
 //--- Session
 input group "Session (UTC)"
-input bool            InpUseSession  = true;       // Trade only inside session
+input bool            InpUseSession  = false;      // Trade only inside session (off = 24h)
 input int             InpSessStart   = 7;          // Session start hour (UTC)
 input int             InpSessEnd     = 17;         // Session end hour (UTC)
 input int             InpTesterGmtOffset = 2;      // Broker server GMT offset (used in Strategy Tester only)
