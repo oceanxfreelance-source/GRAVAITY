@@ -24,7 +24,7 @@ strategy("XAU Aggressive Scalper", shorttitle = "XAU-S", overlay = true,
      default_qty_type = strategy.fixed, default_qty_value = 1,
      commission_type = strategy.commission.cash_per_contract, commission_value = 0.15,
      margin_long = 0.2, margin_short = 0.2,
-     pyramiding = 0, max_labels_count = 500)
+     pyramiding = 0, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 grpT = "Trend"
@@ -84,8 +84,19 @@ lotStepOz = minLotOz
 lotsPerOz = isCent ? 1.0 : 0.01
 
 grpV = "Visuals"
-showDash   = input.bool(true, "Show Stats Panel", group = grpV)
-showLevels = input.bool(true, "Show SL / TP Lines", group = grpV)
+showLevels  = input.bool(true, "Show Trade Boxes (Entry / SL / TP)", group = grpV)
+extendBars  = input.int(12, "Extend Levels Right (bars)", minval = 1, maxval = 200, group = grpV)
+showResult  = input.bool(true, "Show Result of Each Trade", group = grpV)
+showTrend   = input.bool(true, "Show Trend EMA", group = grpV)
+showEmas    = input.bool(false, "Show Fast / Slow EMAs", group = grpV)
+showSt      = input.bool(false, "Show Supertrend", group = grpV)
+showTrendBg = input.bool(false, "Trend Background", group = grpV)
+showSessBg  = input.bool(true, "Shade Outside Session", group = grpV)
+showDash    = input.bool(true, "Show Stats Panel", group = grpV)
+dashPos     = input.string("Top Right", "Panel Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpV)
+cProfit = input.color(#26a69a, "Profit Color", group = grpV)
+cLoss   = input.color(#ef5350, "Loss Color", group = grpV)
+cEntry  = input.color(#9598a1, "Entry Color", group = grpV)
 
 // ── Calculations ────────────────────────────────────────────────────────────
 emaFast  = ta.ema(close, emaFastLen)
@@ -245,24 +256,105 @@ if strategy.position_size < 0 or shortSig
     strategy.exit("S-TP2", "Short", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
 
 // ── Plots ───────────────────────────────────────────────────────────────────
-plot(emaFast, "Fast EMA", color = color.new(color.aqua, 0), linewidth = 1)
-plot(emaSlow, "Slow EMA", color = color.new(color.orange, 0), linewidth = 1)
-plot(emaTrend, "Trend EMA", color = color.new(color.gray, 0), linewidth = 2)
-plot(stLine, "Supertrend", color = stDir < 0 ? color.new(color.lime, 30) : color.new(color.red, 30), style = plot.style_linebr)
+plot(showTrend ? emaTrend : na, "Trend EMA", color = color.new(color.gray, 20), linewidth = 2)
+plot(showEmas ? emaFast : na, "Fast EMA", color = color.new(color.aqua, 40), linewidth = 1)
+plot(showEmas ? emaSlow : na, "Slow EMA", color = color.new(color.orange, 40), linewidth = 1)
+plot(showSt ? stLine : na, "Supertrend", color = stDir < 0 ? color.new(cProfit, 40) : color.new(cLoss, 40), style = plot.style_linebr)
 
-inPos = strategy.position_size != 0
-plot(showLevels and inPos ? slPx : na, "Stop", color = color.red, style = plot.style_linebr, linewidth = 2)
-plot(showLevels and inPos and not tp1Done ? tp1Px : na, "TP1", color = color.new(color.green, 30), style = plot.style_linebr)
-plot(showLevels and inPos ? tp2Px : na, "TP2", color = color.green, style = plot.style_linebr, linewidth = 2)
-plot(showLevels and inPos ? entryPx : na, "Entry", color = color.new(color.white, 40), style = plot.style_linebr)
+plotshape(longSig, "BUY", shape.triangleup, location.belowbar, cProfit, text = "BUY", textcolor = cProfit, size = size.tiny)
+plotshape(shortSig, "SELL", shape.triangledown, location.abovebar, cLoss, text = "SELL", textcolor = cLoss, size = size.tiny)
+plotshape(skippedSig, "Skipped (risk too high)", shape.xcross, location.abovebar, color.new(color.gray, 40), size = size.tiny)
+bgcolor(showSessBg and not inSession ? color.new(color.gray, 94) : showTrendBg and trendUp ? color.new(cProfit, 94) : showTrendBg and trendDn ? color.new(cLoss, 94) : na, title = "Session / Trend Background")
 
-plotshape(longSig, "BUY", shape.labelup, location.belowbar, color.new(color.lime, 0), text = "BUY", textcolor = color.black, size = size.small)
-plotshape(shortSig, "SELL", shape.labeldown, location.abovebar, color.new(color.red, 0), text = "SELL", textcolor = color.white, size = size.small)
-plotshape(skippedSig, "Skipped (risk too high)", shape.xcross, location.abovebar, color.new(color.gray, 0), size = size.tiny)
-bgcolor(not inSession ? color.new(color.gray, 92) : trendUp ? color.new(color.green, 93) : trendDn ? color.new(color.red, 93) : na, title = "Trend / Session Background")
+// ── Trade boxes: entry, SL, TP1, TP2 with price and money at risk / to gain ──
+priceTxt(float p) =>
+    str.tostring(p, format.mintick)
+
+money(float usd) =>
+    isCent ? str.tostring(usd * 100, "#") + " USC" : "$" + str.tostring(usd, "#.##")
+
+setLevel(line ln, label lb, int x1, int x2, float y, string txt) =>
+    line.set_xy1(ln, x1, y)
+    line.set_xy2(ln, x2, y)
+    label.set_xy(lb, x2, y)
+    label.set_text(lb, txt)
+
+levelLabel(color bg, color txt) =>
+    label.new(bar_index, close, "", style = label.style_label_left, color = bg, textcolor = txt, size = size.small)
+
+var box   riskBox   = na
+var box   rewardBox = na
+var line  entryLine = na
+var line  slLine    = na
+var line  tp1Line   = na
+var line  tp2Line   = na
+var label entryLbl  = na
+var label slLbl     = na
+var label tp1Lbl    = na
+var label tp2Lbl    = na
+var bool  drawing   = false
+var bool  drawLong  = true
+var int   drawX1    = na
+var float initSl    = na
+var float entryNet  = 0.0
+
+if showLevels and (longSig or shortSig)
+    drawing  := true
+    drawLong := longSig
+    drawX1   := bar_index
+    initSl   := slPx
+    entryNet := strategy.netprofit
+    riskBox   := box.new(bar_index, entryPx, bar_index + extendBars, slPx, border_color = color.new(cLoss, 60), border_width = 1, bgcolor = color.new(cLoss, 85))
+    rewardBox := box.new(bar_index, entryPx, bar_index + extendBars, tp2Px, border_color = color.new(cProfit, 60), border_width = 1, bgcolor = color.new(cProfit, 85))
+    entryLine := line.new(bar_index, entryPx, bar_index + extendBars, entryPx, color = cEntry, width = 2)
+    slLine    := line.new(bar_index, slPx, bar_index + extendBars, slPx, color = cLoss, width = 2)
+    tp1Line   := line.new(bar_index, tp1Px, bar_index + extendBars, tp1Px, color = cProfit, width = 1, style = line.style_dashed)
+    tp2Line   := line.new(bar_index, tp2Px, bar_index + extendBars, tp2Px, color = cProfit, width = 2)
+    entryLbl  := levelLabel(cEntry, color.white)
+    slLbl     := levelLabel(cLoss, color.white)
+    tp1Lbl    := levelLabel(color.new(cProfit, 30), color.white)
+    tp2Lbl    := levelLabel(cProfit, color.white)
+else if drawing and (newLong or newShort)
+    // Levels were re-anchored to the real fill price
+    initSl := entryPx - (drawLong ? 1.0 : -1.0) * sigAtr * slMult
+
+if drawing
+    finished = strategy.position_size == 0 and not (longSig or shortSig)
+    x2 = finished ? bar_index : bar_index + extendBars
+    qty  = nz(lastQty)
+    tp1Q = qty * tp1QtyPct / 100
+    tp2Q = qty - tp1Q
+    slLocked = drawLong ? slPx >= entryPx : slPx <= entryPx
+    slMoney  = qty * math.abs(entryPx - slPx) * syminfo.pointvalue
+
+    box.set_lefttop(riskBox, drawX1, math.max(entryPx, initSl))
+    box.set_rightbottom(riskBox, x2, math.min(entryPx, initSl))
+    box.set_lefttop(rewardBox, drawX1, math.max(entryPx, tp2Px))
+    box.set_rightbottom(rewardBox, x2, math.min(entryPx, tp2Px))
+
+    setLevel(entryLine, entryLbl, drawX1, x2, entryPx, (drawLong ? "BUY " : "SELL ") + priceTxt(entryPx) + "  |  " + lotText(qty))
+    slTag = not tp1Done ? "SL " : slLocked ? (math.abs(slPx - entryPx) < syminfo.mintick ? "BE " : "TRAIL ") : "SL "
+    setLevel(slLine, slLbl, drawX1, x2, slPx, slTag + priceTxt(slPx) + "  " + (slLocked ? "+" : "-") + money(slMoney))
+    setLevel(tp1Line, tp1Lbl, drawX1, x2, tp1Px, "TP1 " + priceTxt(tp1Px) + "  " + (tp1Done ? "HIT" : "+" + money(tp1Q * math.abs(tp1Px - entryPx) * syminfo.pointvalue)))
+    setLevel(tp2Line, tp2Lbl, drawX1, x2, tp2Px, "TP2 " + priceTxt(tp2Px) + "  " + (tp2Q > 0 ? "+" + money(tp2Q * math.abs(tp2Px - entryPx) * syminfo.pointvalue) : "(all closed at TP1)"))
+
+    if finished
+        // Freeze the box at the exit bar and fade the level tags
+        label.set_color(entryLbl, color.new(cEntry, 60))
+        label.set_color(slLbl, color.new(cLoss, 60))
+        label.set_color(tp1Lbl, color.new(cProfit, 60))
+        label.set_color(tp2Lbl, color.new(cProfit, 60))
+        if showResult
+            res = strategy.netprofit - entryNet
+            win = res >= 0
+            label.new(bar_index, win == drawLong ? high : low, (win ? "+" : "-") + money(math.abs(res)),
+                 style = win == drawLong ? label.style_label_down : label.style_label_up,
+                 color = win ? cProfit : cLoss, textcolor = color.white, size = size.small)
+        drawing := false
 
 // ── Stats panel ─────────────────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 20), border_width = 1)
+dashLoc = dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Bottom Left" ? position.bottom_left : position.top_right
+var table dash = table.new(dashLoc, 2, 10, bgcolor = color.new(color.black, 20), border_width = 1)
 if showDash and barstate.islast
     closed = strategy.closedtrades
     winRate = closed > 0 ? float(strategy.wintrades) / closed * 100 : 0.0
