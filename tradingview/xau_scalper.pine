@@ -84,14 +84,14 @@ useStFlip  = input.bool(true, "Exit on Supertrend Flip", group = grpR)
 singleMode = exitMode == "Single TP (high win rate)"
 
 grpA = "Account & Position Size"
-accountType   = input.string("Standard", "Account Type", options = ["Cent", "Standard"], group = grpA)
+accountType   = input.string("Cent", "Account Type", options = ["Cent", "Standard"], group = grpA)
 riskPct       = input.float(5.0, "Risk per Trade % (aggressive)", minval = 0.1, step = 0.5, group = grpA)
 maxRiskPct    = input.float(25.0, "Skip Trade if Min Size Risks More Than %", minval = 0.1, group = grpA, tooltip = "Standard account: 0.01 lot = 1 oz, so the 4 USD stop = about 4.30 USD loss with spread (17% of 25 USD). If the account falls below about 17 USD the script stops trading to protect what is left.")
 maxDailyLoss  = input.float(20.0, "Daily Loss Limit % (stop trading for the day)", minval = 0.1, group = grpA)
 maxTradesDay  = input.int(8, "Max Trades per Day", minval = 1, group = grpA)
 
 grpG = "Martingale (high risk)"
-useMart     = input.bool(false, "Use Martingale", group = grpG, tooltip = "After a losing trade the next trade size is multiplied. A win resets it to the base size. With 25 USD on a standard account, 3 losses in a row can wipe most of the account.")
+useMart     = input.bool(true, "Use Martingale", group = grpG, tooltip = "After a losing trade the next trade size is multiplied. A win resets it to the base size. With 25 USD on a standard account, 3 losses in a row can wipe most of the account.")
 martMult    = input.float(2.0, "Size Multiplier After Loss", minval = 1.1, step = 0.1, group = grpG)
 martSteps   = input.int(2, "Max Martingale Steps", minval = 1, maxval = 5, group = grpG)
 martMaxRisk = input.float(70.0, "Max Risk % for a Martingale Trade", minval = 1, maxval = 100, group = grpG, tooltip = "If the multiplied size would lose more than this % of equity at the stop, the script falls back to the base size.")
