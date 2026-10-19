@@ -90,6 +90,12 @@ maxRiskPct    = input.float(25.0, "Skip Trade if Min Size Risks More Than %", mi
 maxDailyLoss  = input.float(20.0, "Daily Loss Limit % (stop trading for the day)", minval = 0.1, group = grpA)
 maxTradesDay  = input.int(8, "Max Trades per Day", minval = 1, group = grpA)
 
+grpG = "Martingale (high risk)"
+useMart     = input.bool(false, "Use Martingale", group = grpG, tooltip = "After a losing trade the next trade size is multiplied. A win resets it to the base size. With 25 USD on a standard account, 3 losses in a row can wipe most of the account.")
+martMult    = input.float(2.0, "Size Multiplier After Loss", minval = 1.1, step = 0.1, group = grpG)
+martSteps   = input.int(2, "Max Martingale Steps", minval = 1, maxval = 5, group = grpG)
+martMaxRisk = input.float(70.0, "Max Risk % for a Martingale Trade", minval = 1, maxval = 100, group = grpG, tooltip = "If the multiplied size would lose more than this % of equity at the stop, the script falls back to the base size.")
+
 isCent = accountType == "Cent"
 // Smallest order = 0.01 lot = 0.01 oz on cent, 1 oz on standard
 minLotOz  = isCent ? 0.01 : 1.0
@@ -161,6 +167,12 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
     lastExitBar := bar_index
 cooldownOk = bar_index - lastExitBar > cooldown
 
+// Martingale step: losing trade => next level, winning trade => back to base size
+var int   martLevel = 0
+var float martNet   = 0.0
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    martLevel := strategy.netprofit - martNet > 0 ? 0 : math.min(martLevel + 1, martSteps)
+
 newDay = ta.change(time("D")) != 0
 var float dayStartEq = strategy.initial_capital
 var int dayTrades = 0
@@ -173,9 +185,14 @@ dayOk = dayLossPct < maxDailyLoss and dayTrades < maxTradesDay
 // Position size: risk % of equity / stop distance, rounded down to the broker step
 rawQty  = strategy.equity * riskPct / 100 / (slDist * syminfo.pointvalue)
 stepQty = math.floor(rawQty / lotStepOz) * lotStepOz
-tradeQty = math.max(stepQty, minLotOz)
-tradeRiskPct = strategy.equity > 0 ? tradeQty * slDist * syminfo.pointvalue / strategy.equity * 100 : 100.0
-sizeOk = tradeRiskPct <= maxRiskPct
+baseQty = math.max(stepQty, minLotOz)
+martQty = math.max(math.floor(baseQty * math.pow(martMult, martLevel) / lotStepOz + 1e-9) * lotStepOz, baseQty)
+riskPctOf(float qty) =>
+    strategy.equity > 0 ? qty * slDist * syminfo.pointvalue / strategy.equity * 100 : 100.0
+useMartSize = useMart and martLevel > 0 and riskPctOf(martQty) <= martMaxRisk
+tradeQty = useMartSize ? martQty : baseQty
+tradeRiskPct = riskPctOf(tradeQty)
+sizeOk = useMartSize or tradeRiskPct <= maxRiskPct
 
 allowLong  = tradeDir != "Short Only"
 allowShort = tradeDir != "Long Only"
@@ -221,6 +238,7 @@ if longSig
     slPx := s, tp1Px := t1, tp2Px := t2
     tp1Done := false
     dayTrades += 1
+    martNet := strategy.netprofit
     strategy.entry("Long", strategy.long, qty = tradeQty)
     alert("XAU BUY @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + tpAlertText(), alert.freq_once_per_bar_close)
 
@@ -235,6 +253,7 @@ if shortSig
     slPx := s, tp1Px := t1, tp2Px := t2
     tp1Done := false
     dayTrades += 1
+    martNet := strategy.netprofit
     strategy.entry("Short", strategy.short, qty = tradeQty)
     alert("XAU SELL @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + tpAlertText(), alert.freq_once_per_bar_close)
 
@@ -394,7 +413,7 @@ if drawing
 
 // ── Stats panel ─────────────────────────────────────────────────────────────
 dashLoc = dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Bottom Left" ? position.bottom_left : position.top_right
-var table dash = table.new(dashLoc, 2, 10, bgcolor = color.new(color.black, 20), border_width = 1)
+var table dash = table.new(dashLoc, 2, 11, bgcolor = color.new(color.black, 20), border_width = 1)
 if showDash and barstate.islast
     closed = strategy.closedtrades
     winRate = closed > 0 ? float(strategy.wintrades) / closed * 100 : 0.0
@@ -421,3 +440,5 @@ if showDash and barstate.islast
     table.cell(dash, 1, 8, str.tostring(slDist, "#.00") + " USD/oz", text_color = color.white, text_size = size.small)
     table.cell(dash, 0, 9, "Trend / Session", text_color = color.white, text_size = size.small)
     table.cell(dash, 1, 9, (trendUp ? "BULL" : trendDn ? "BEAR" : "NEUTRAL") + (inSession ? " / OPEN" : " / CLOSED"), text_color = trendUp ? color.lime : trendDn ? color.red : color.gray, text_size = size.small)
+    table.cell(dash, 0, 10, "Martingale", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 10, useMart ? "Step " + str.tostring(martLevel) + " / " + str.tostring(martSteps) + (useMartSize ? "  x" + str.tostring(math.pow(martMult, martLevel), "#.##") : "") : "OFF", text_color = useMart and martLevel > 0 ? color.orange : color.gray, text_size = size.small)
