@@ -10,10 +10,10 @@
 //  - Spread modelled as a per-ounce commission
 //  - London + New York session filter (gold chops in the Asian session)
 //  - Daily loss limit and max trades per day
-//  - Default exit "Single TP": SL 2 x ATR, TP 1 x ATR, stop moves to
-//    break-even (+0.40 USD) once price moves 0.6 x ATR in your favour.
+//  - Default exit "Single TP" with a fixed stop of 4 USD and target of 2 USD
+//    per oz (0.01 lot on a standard account = -4 / +2 USD per trade).
 //    In a Python replica backtest on 60 days of 5m gold (Aug-Oct 2026) this
-//    gave ~88% win rate, profit factor ~1.5 (41 trades). On 1m the spread ate
+//    gave ~85% win rate, profit factor ~2.3 (41 trades). On 1m the spread ate
 //    the profit, so use 5m. Past results do not guarantee future results.
 //
 //  Units: TradingView XAUUSD 1 contract = 1 oz. Backtest equity is in real USD
@@ -66,12 +66,16 @@ grpR = "Exits (ATR multiples)"
 atrLen     = input.int(14, "ATR Length", minval = 1, group = grpR)
 exitMode   = input.string("Single TP (high win rate)", "Exit Mode", options = ["Single TP (high win rate)", "TP1 + TP2 (partial)"], group = grpR, tooltip = "Single TP: whole position closes at TP, so one trade = one result in the win rate. Partial: TradingView counts each part as its own trade, so a TP1 + break-even exit shows as one win and one loss.")
 slMult     = input.float(2.0, "Stop Loss x ATR", minval = 0.1, step = 0.1, group = grpR)
+stopType   = input.string("Fixed USD", "Stop / Target Type", options = ["Fixed USD", "ATR"], group = grpR, tooltip = "Fixed USD keeps the loss per 0.01 lot (standard account) small and predictable. ATR scales with volatility.")
+slUsd      = input.float(4.0, "Stop Loss (USD per oz, Fixed mode)", minval = 0.1, step = 0.1, group = grpR)
+tpUsd      = input.float(2.0, "Take Profit (USD per oz, Fixed mode)", minval = 0.1, step = 0.1, group = grpR)
+beUsd      = input.float(0.8, "Break-Even Trigger (USD per oz, Fixed mode)", minval = 0.1, step = 0.1, group = grpR)
 minSlUsd   = input.float(1.0, "Minimum Stop Distance (USD per oz)", minval = 0, step = 0.1, group = grpR)
 tp1Mult    = input.float(1.0, "TP / TP1 x ATR", minval = 0.1, step = 0.1, group = grpR)
 tp2Mult    = input.float(2.5, "TP2 x ATR (partial mode)", minval = 0.1, step = 0.1, group = grpR)
 tp1Pct     = input.int(50, "TP1 Close % (partial mode)", minval = 1, maxval = 100, group = grpR)
-useBE      = input.bool(true, "Break-Even Stop", group = grpR)
-beTrig     = input.float(0.6, "Break-Even Trigger x ATR (single mode)", minval = 0.1, step = 0.1, group = grpR)
+useBE      = input.bool(false, "Break-Even Stop", group = grpR, tooltip = "Off by default: with the fixed 4 / 2 USD stop and target it lowered profit in testing. Turn on for ATR mode (trigger 0.6 x ATR).")
+beTrig     = input.float(0.6, "Break-Even Trigger x ATR (ATR mode)", minval = 0.1, step = 0.1, group = grpR)
 beOffset   = input.float(0.4, "Break-Even Lock (USD per oz, covers spread)", minval = 0, step = 0.1, group = grpR)
 useTrail   = input.bool(true, "ATR Trailing Stop After TP1 (partial mode)", group = grpR)
 trailMult  = input.float(2.0, "Trail x ATR", minval = 0.1, step = 0.1, group = grpR)
@@ -82,7 +86,7 @@ singleMode = exitMode == "Single TP (high win rate)"
 grpA = "Account & Position Size"
 accountType   = input.string("Standard", "Account Type", options = ["Cent", "Standard"], group = grpA)
 riskPct       = input.float(5.0, "Risk per Trade % (aggressive)", minval = 0.1, step = 0.5, group = grpA)
-maxRiskPct    = input.float(12.0, "Skip Trade if Min Size Risks More Than %", minval = 0.1, group = grpA, tooltip = "Standard account: 0.01 lot = 1 oz, so a 10 USD stop = 10 USD loss. With a small deposit most trades will be skipped unless you raise this.")
+maxRiskPct    = input.float(25.0, "Skip Trade if Min Size Risks More Than %", minval = 0.1, group = grpA, tooltip = "Standard account: 0.01 lot = 1 oz, so the 4 USD stop = about 4.30 USD loss with spread (17% of 25 USD). If the account falls below about 17 USD the script stops trading to protect what is left.")
 maxDailyLoss  = input.float(20.0, "Daily Loss Limit % (stop trading for the day)", minval = 0.1, group = grpA)
 maxTradesDay  = input.int(8, "Max Trades per Day", minval = 1, group = grpA)
 
@@ -119,6 +123,11 @@ rsi = ta.rsi(close, rsiLen)
 atr = ta.atr(atrLen)
 // Widen the ATR unit when the market is too quiet, so SL >= minSlUsd and TPs scale with it
 effAtr = math.max(atr, minSlUsd / slMult)
+useFixed = stopType == "Fixed USD"
+slDist  = useFixed ? slUsd : effAtr * slMult
+tp1Dist = useFixed ? tpUsd : effAtr * tp1Mult
+tp2Dist = useFixed ? tpUsd * tp2Mult / tp1Mult : effAtr * tp2Mult
+beDist  = useFixed ? beUsd : effAtr * beTrig
 volSma = ta.sma(volume, volLen)
 histUp = ta.crossover(hist, 0)
 histDn = ta.crossunder(hist, 0)
@@ -162,7 +171,6 @@ dayLossPct = dayStartEq > 0 ? (dayStartEq - strategy.equity) / dayStartEq * 100 
 dayOk = dayLossPct < maxDailyLoss and dayTrades < maxTradesDay
 
 // Position size: risk % of equity / stop distance, rounded down to the broker step
-slDist  = effAtr * slMult
 rawQty  = strategy.equity * riskPct / 100 / (slDist * syminfo.pointvalue)
 stepQty = math.floor(rawQty / lotStepOz) * lotStepOz
 tradeQty = math.max(stepQty, minLotOz)
@@ -185,13 +193,16 @@ var float entryPx = na
 var float slPx    = na
 var float tp1Px   = na
 var float tp2Px   = na
-var float sigAtr  = na
+var float sigSl   = na
+var float sigTp1  = na
+var float sigTp2  = na
+var float sigBe   = na
 var float lastQty = na
 var bool  tp1Done = false
 
 setLevels(float basePx, bool isLong) =>
     dir = isLong ? 1.0 : -1.0
-    [basePx - dir * sigAtr * slMult, basePx + dir * sigAtr * tp1Mult, basePx + dir * sigAtr * tp2Mult]
+    [basePx - dir * sigSl, basePx + dir * sigTp1, basePx + dir * sigTp2]
 
 tpAlertText() =>
     singleMode ? " | TP " + str.tostring(tp1Px, format.mintick) : " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick)
@@ -200,7 +211,10 @@ lotText(float qty) =>
     str.tostring(qty * lotsPerOz, "#.##") + " lot (" + str.tostring(qty, "#.##") + " oz)"
 
 if longSig
-    sigAtr  := effAtr
+    sigSl   := slDist
+    sigTp1  := tp1Dist
+    sigTp2  := tp2Dist
+    sigBe   := beDist
     entryPx := close
     lastQty := tradeQty
     [s, t1, t2] = setLevels(close, true)
@@ -211,7 +225,10 @@ if longSig
     alert("XAU BUY @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + tpAlertText(), alert.freq_once_per_bar_close)
 
 if shortSig
-    sigAtr  := effAtr
+    sigSl   := slDist
+    sigTp1  := tp1Dist
+    sigTp2  := tp2Dist
+    sigBe   := beDist
     entryPx := close
     lastQty := tradeQty
     [s, t1, t2] = setLevels(close, false)
@@ -234,7 +251,7 @@ if newLong or newShort
 if strategy.position_size > 0
     if not singleMode and not tp1Done and (high >= tp1Px or strategy.position_size < strategy.position_size[1])
         tp1Done := true
-    if useBE and singleMode and high >= entryPx + sigAtr * beTrig
+    if useBE and singleMode and high >= entryPx + sigBe
         slPx := math.max(slPx, entryPx + beOffset)
     if tp1Done
         if useBE
@@ -247,7 +264,7 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     if not singleMode and not tp1Done and (low <= tp1Px or strategy.position_size > strategy.position_size[1])
         tp1Done := true
-    if useBE and singleMode and low <= entryPx - sigAtr * beTrig
+    if useBE and singleMode and low <= entryPx - sigBe
         slPx := math.min(slPx, entryPx - beOffset)
     if tp1Done
         if useBE
@@ -336,7 +353,7 @@ if showLevels and (longSig or shortSig)
     tp2Lbl    := singleMode ? na : levelLabel(cProfit, color.white)
 else if drawing and (newLong or newShort)
     // Levels were re-anchored to the real fill price
-    initSl := entryPx - (drawLong ? 1.0 : -1.0) * sigAtr * slMult
+    initSl := entryPx - (drawLong ? 1.0 : -1.0) * sigSl
 
 if drawing
     finished = strategy.position_size == 0 and not (longSig or shortSig)
