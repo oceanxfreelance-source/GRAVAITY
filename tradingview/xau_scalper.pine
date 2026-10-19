@@ -10,6 +10,11 @@
 //  - Spread modelled as a per-ounce commission
 //  - London + New York session filter (gold chops in the Asian session)
 //  - Daily loss limit and max trades per day
+//  - Default exit "Single TP": SL 2 x ATR, TP 1 x ATR, stop moves to
+//    break-even (+0.40 USD) once price moves 0.6 x ATR in your favour.
+//    In a Python replica backtest on 60 days of 5m gold (Aug-Oct 2026) this
+//    gave ~88% win rate, profit factor ~1.5 (41 trades). On 1m the spread ate
+//    the profit, so use 5m. Past results do not guarantee future results.
 //
 //  Units: TradingView XAUUSD 1 contract = 1 oz. Backtest equity is in real USD
 //         (a 2500 USC cent balance = 25 USD).
@@ -45,7 +50,7 @@ rsiLongMax   = input.float(72, "RSI Long Max (avoid overbought)", group = grpM)
 rsiShortMax  = input.float(50, "RSI Short Max", group = grpM)
 rsiShortMin  = input.float(28, "RSI Short Min (avoid oversold)", group = grpM)
 adxLen       = input.int(14, "ADX Length", minval = 1, group = grpM)
-adxMin       = input.float(22, "ADX Minimum (trend strength)", group = grpM)
+adxMin       = input.float(26, "ADX Minimum (trend strength)", group = grpM)
 pullbackBars = input.int(5, "Pullback Lookback (bars)", minval = 1, group = grpM)
 useVol       = input.bool(true, "Use (Tick) Volume Filter", group = grpM)
 volLen       = input.int(20, "Volume MA Length", minval = 1, group = grpM)
@@ -59,15 +64,20 @@ sessionTz  = input.string("UTC", "Session Timezone", group = grpS)
 
 grpR = "Exits (ATR multiples)"
 atrLen     = input.int(14, "ATR Length", minval = 1, group = grpR)
-slMult     = input.float(1.5, "Stop Loss x ATR", minval = 0.1, step = 0.1, group = grpR)
+exitMode   = input.string("Single TP (high win rate)", "Exit Mode", options = ["Single TP (high win rate)", "TP1 + TP2 (partial)"], group = grpR, tooltip = "Single TP: whole position closes at TP, so one trade = one result in the win rate. Partial: TradingView counts each part as its own trade, so a TP1 + break-even exit shows as one win and one loss.")
+slMult     = input.float(2.0, "Stop Loss x ATR", minval = 0.1, step = 0.1, group = grpR)
 minSlUsd   = input.float(1.0, "Minimum Stop Distance (USD per oz)", minval = 0, step = 0.1, group = grpR)
-tp1Mult    = input.float(1.0, "TP1 x ATR (partial close)", minval = 0.1, step = 0.1, group = grpR)
-tp2Mult    = input.float(2.5, "TP2 x ATR (rest)", minval = 0.1, step = 0.1, group = grpR)
-tp1Pct     = input.int(50, "TP1 Close %", minval = 1, maxval = 100, group = grpR)
-useBE      = input.bool(true, "Move Stop to Break-Even After TP1", group = grpR)
-useTrail   = input.bool(true, "ATR Trailing Stop After TP1", group = grpR)
+tp1Mult    = input.float(1.0, "TP / TP1 x ATR", minval = 0.1, step = 0.1, group = grpR)
+tp2Mult    = input.float(2.5, "TP2 x ATR (partial mode)", minval = 0.1, step = 0.1, group = grpR)
+tp1Pct     = input.int(50, "TP1 Close % (partial mode)", minval = 1, maxval = 100, group = grpR)
+useBE      = input.bool(true, "Break-Even Stop", group = grpR)
+beTrig     = input.float(0.6, "Break-Even Trigger x ATR (single mode)", minval = 0.1, step = 0.1, group = grpR)
+beOffset   = input.float(0.4, "Break-Even Lock (USD per oz, covers spread)", minval = 0, step = 0.1, group = grpR)
+useTrail   = input.bool(true, "ATR Trailing Stop After TP1 (partial mode)", group = grpR)
 trailMult  = input.float(2.0, "Trail x ATR", minval = 0.1, step = 0.1, group = grpR)
 useStFlip  = input.bool(true, "Exit on Supertrend Flip", group = grpR)
+
+singleMode = exitMode == "Single TP (high win rate)"
 
 grpA = "Account & Position Size"
 accountType   = input.string("Cent", "Account Type", options = ["Cent", "Standard"], group = grpA)
@@ -183,6 +193,9 @@ setLevels(float basePx, bool isLong) =>
     dir = isLong ? 1.0 : -1.0
     [basePx - dir * sigAtr * slMult, basePx + dir * sigAtr * tp1Mult, basePx + dir * sigAtr * tp2Mult]
 
+tpAlertText() =>
+    singleMode ? " | TP " + str.tostring(tp1Px, format.mintick) : " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick)
+
 lotText(float qty) =>
     str.tostring(qty * lotsPerOz, "#.##") + " lot (" + str.tostring(qty, "#.##") + " oz)"
 
@@ -195,7 +208,7 @@ if longSig
     tp1Done := false
     dayTrades += 1
     strategy.entry("Long", strategy.long, qty = tradeQty)
-    alert("XAU BUY @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick), alert.freq_once_per_bar_close)
+    alert("XAU BUY @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + tpAlertText(), alert.freq_once_per_bar_close)
 
 if shortSig
     sigAtr  := effAtr
@@ -206,7 +219,7 @@ if shortSig
     tp1Done := false
     dayTrades += 1
     strategy.entry("Short", strategy.short, qty = tradeQty)
-    alert("XAU SELL @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick), alert.freq_once_per_bar_close)
+    alert("XAU SELL @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + tpAlertText(), alert.freq_once_per_bar_close)
 
 // Re-anchor levels to the real fill price on the bar the position opens
 newLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
@@ -216,24 +229,29 @@ if newLong or newShort
     [s, t1, t2] = setLevels(entryPx, newLong)
     slPx := s, tp1Px := t1, tp2Px := t2
 
-// TP1 reached => break-even + trailing
+// Break-even: single mode once price moves beTrig x ATR, partial mode after TP1.
+// The stop locks beOffset in profit so spread / commission are covered.
 if strategy.position_size > 0
-    if not tp1Done and (high >= tp1Px or strategy.position_size < strategy.position_size[1])
+    if not singleMode and not tp1Done and (high >= tp1Px or strategy.position_size < strategy.position_size[1])
         tp1Done := true
+    if useBE and singleMode and high >= entryPx + sigAtr * beTrig
+        slPx := math.max(slPx, entryPx + beOffset)
     if tp1Done
         if useBE
-            slPx := math.max(slPx, entryPx)
+            slPx := math.max(slPx, entryPx + beOffset)
         if useTrail
             slPx := math.max(slPx, close - effAtr * trailMult)
     if useStFlip and stDir > 0
         strategy.close("Long", comment = "ST flip")
 
 if strategy.position_size < 0
-    if not tp1Done and (low <= tp1Px or strategy.position_size > strategy.position_size[1])
+    if not singleMode and not tp1Done and (low <= tp1Px or strategy.position_size > strategy.position_size[1])
         tp1Done := true
+    if useBE and singleMode and low <= entryPx - sigAtr * beTrig
+        slPx := math.min(slPx, entryPx - beOffset)
     if tp1Done
         if useBE
-            slPx := math.min(slPx, entryPx)
+            slPx := math.min(slPx, entryPx - beOffset)
         if useTrail
             slPx := math.min(slPx, close + effAtr * trailMult)
     if useStFlip and stDir < 0
@@ -242,18 +260,20 @@ if strategy.position_size < 0
 // A partial close smaller than the broker minimum is not possible, so with
 // 1 x minimum size the whole position exits at TP1.
 canSplit = nz(lastQty) >= 2 * minLotOz
-tp1QtyPct = canSplit ? tp1Pct : 100
+tp1QtyPct = singleMode or not canSplit ? 100 : tp1Pct
 
 // Exit orders (re-sent each bar so the stop follows slPx)
 if strategy.position_size > 0 or longSig
     if not tp1Done
-        strategy.exit("L-TP1", "Long", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = "TP1", comment_loss = "SL")
-    strategy.exit("L-TP2", "Long", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
+        strategy.exit("L-TP1", "Long", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = singleMode ? "TP" : "TP1", comment_loss = slPx >= entryPx ? "BE" : "SL")
+    if not singleMode
+        strategy.exit("L-TP2", "Long", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
 
 if strategy.position_size < 0 or shortSig
     if not tp1Done
-        strategy.exit("S-TP1", "Short", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = "TP1", comment_loss = "SL")
-    strategy.exit("S-TP2", "Short", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
+        strategy.exit("S-TP1", "Short", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = singleMode ? "TP" : "TP1", comment_loss = slPx <= entryPx ? "BE" : "SL")
+    if not singleMode
+        strategy.exit("S-TP2", "Short", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
 
 // ── Plots ───────────────────────────────────────────────────────────────────
 plot(showTrend ? emaTrend : na, "Trend EMA", color = color.new(color.gray, 20), linewidth = 2)
@@ -305,15 +325,15 @@ if showLevels and (longSig or shortSig)
     initSl   := slPx
     entryNet := strategy.netprofit
     riskBox   := box.new(bar_index, entryPx, bar_index + extendBars, slPx, border_color = color.new(cLoss, 60), border_width = 1, bgcolor = color.new(cLoss, 85))
-    rewardBox := box.new(bar_index, entryPx, bar_index + extendBars, tp2Px, border_color = color.new(cProfit, 60), border_width = 1, bgcolor = color.new(cProfit, 85))
+    rewardBox := box.new(bar_index, entryPx, bar_index + extendBars, singleMode ? tp1Px : tp2Px, border_color = color.new(cProfit, 60), border_width = 1, bgcolor = color.new(cProfit, 85))
     entryLine := line.new(bar_index, entryPx, bar_index + extendBars, entryPx, color = cEntry, width = 2)
     slLine    := line.new(bar_index, slPx, bar_index + extendBars, slPx, color = cLoss, width = 2)
-    tp1Line   := line.new(bar_index, tp1Px, bar_index + extendBars, tp1Px, color = cProfit, width = 1, style = line.style_dashed)
-    tp2Line   := line.new(bar_index, tp2Px, bar_index + extendBars, tp2Px, color = cProfit, width = 2)
+    tp1Line   := line.new(bar_index, tp1Px, bar_index + extendBars, tp1Px, color = cProfit, width = singleMode ? 2 : 1, style = singleMode ? line.style_solid : line.style_dashed)
+    tp2Line   := singleMode ? na : line.new(bar_index, tp2Px, bar_index + extendBars, tp2Px, color = cProfit, width = 2)
     entryLbl  := levelLabel(cEntry, color.white)
     slLbl     := levelLabel(cLoss, color.white)
-    tp1Lbl    := levelLabel(color.new(cProfit, 30), color.white)
-    tp2Lbl    := levelLabel(cProfit, color.white)
+    tp1Lbl    := levelLabel(singleMode ? cProfit : color.new(cProfit, 30), color.white)
+    tp2Lbl    := singleMode ? na : levelLabel(cProfit, color.white)
 else if drawing and (newLong or newShort)
     // Levels were re-anchored to the real fill price
     initSl := entryPx - (drawLong ? 1.0 : -1.0) * sigAtr * slMult
@@ -329,21 +349,24 @@ if drawing
 
     box.set_lefttop(riskBox, drawX1, math.max(entryPx, initSl))
     box.set_rightbottom(riskBox, x2, math.min(entryPx, initSl))
-    box.set_lefttop(rewardBox, drawX1, math.max(entryPx, tp2Px))
-    box.set_rightbottom(rewardBox, x2, math.min(entryPx, tp2Px))
+    rewardPx = singleMode ? tp1Px : tp2Px
+    box.set_lefttop(rewardBox, drawX1, math.max(entryPx, rewardPx))
+    box.set_rightbottom(rewardBox, x2, math.min(entryPx, rewardPx))
 
     setLevel(entryLine, entryLbl, drawX1, x2, entryPx, (drawLong ? "BUY " : "SELL ") + priceTxt(entryPx) + "  |  " + lotText(qty))
-    slTag = not tp1Done ? "SL " : slLocked ? (math.abs(slPx - entryPx) < syminfo.mintick ? "BE " : "TRAIL ") : "SL "
+    slTag = slLocked ? (math.abs(slPx - entryPx) <= beOffset + syminfo.mintick ? "BE " : "TRAIL ") : "SL "
     setLevel(slLine, slLbl, drawX1, x2, slPx, slTag + priceTxt(slPx) + "  " + (slLocked ? "+" : "-") + money(slMoney))
-    setLevel(tp1Line, tp1Lbl, drawX1, x2, tp1Px, "TP1 " + priceTxt(tp1Px) + "  " + (tp1Done ? "HIT" : "+" + money(tp1Q * math.abs(tp1Px - entryPx) * syminfo.pointvalue)))
-    setLevel(tp2Line, tp2Lbl, drawX1, x2, tp2Px, "TP2 " + priceTxt(tp2Px) + "  " + (tp2Q > 0 ? "+" + money(tp2Q * math.abs(tp2Px - entryPx) * syminfo.pointvalue) : "(all closed at TP1)"))
+    setLevel(tp1Line, tp1Lbl, drawX1, x2, tp1Px, (singleMode ? "TP " : "TP1 ") + priceTxt(tp1Px) + "  " + (tp1Done ? "HIT" : "+" + money(tp1Q * math.abs(tp1Px - entryPx) * syminfo.pointvalue)))
+    if not singleMode
+        setLevel(tp2Line, tp2Lbl, drawX1, x2, tp2Px, "TP2 " + priceTxt(tp2Px) + "  " + (tp2Q > 0 ? "+" + money(tp2Q * math.abs(tp2Px - entryPx) * syminfo.pointvalue) : "(all closed at TP1)"))
 
     if finished
         // Freeze the box at the exit bar and fade the level tags
         label.set_color(entryLbl, color.new(cEntry, 60))
         label.set_color(slLbl, color.new(cLoss, 60))
         label.set_color(tp1Lbl, color.new(cProfit, 60))
-        label.set_color(tp2Lbl, color.new(cProfit, 60))
+        if not singleMode
+            label.set_color(tp2Lbl, color.new(cProfit, 60))
         if showResult
             res = strategy.netprofit - entryNet
             win = res >= 0
