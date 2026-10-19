@@ -1,0 +1,283 @@
+//@version=6
+// ============================================================================
+//  XAU Aggressive Scalper (strategy) - tuned for XAUUSD on 1m / 5m
+//
+//  Same core logic as aggressive_trend_scalper.pine, plus:
+//  - Risk-based lot sizing for a small account (default deposit 25 USD)
+//  - Minimum lot / lot step so backtests match what a broker will accept
+//  - Max risk per trade guard: skips trades whose minimum lot risks too much
+//  - Minimum stop distance in USD so the spread does not stop you out
+//  - Spread modelled as a per-ounce commission
+//  - London + New York session filter (gold chops in the Asian session)
+//  - Daily loss limit and max trades per day
+//
+//  Units: TradingView XAUUSD 1 contract = 1 oz.
+//         Standard account: 0.01 lot = 1 oz.  Cent account: 0.01 lot = 0.01 oz.
+//
+//  IMPORTANT: no script can guarantee a win rate. Backtest on your broker's
+//  XAUUSD symbol and forward test on demo before using real money.
+// ============================================================================
+strategy("XAU Aggressive Scalper", shorttitle = "XAU-S", overlay = true,
+     initial_capital = 25, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.15,
+     margin_long = 0.2, margin_short = 0.2,
+     pyramiding = 0, max_labels_count = 500)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grpT = "Trend"
+tradeDir    = input.string("Both", "Trade Direction", options = ["Both", "Long Only", "Short Only"], group = grpT)
+emaFastLen  = input.int(9, "Fast EMA", minval = 1, group = grpT)
+emaSlowLen  = input.int(21, "Slow EMA (pullback)", minval = 1, group = grpT)
+emaTrendLen = input.int(200, "Trend EMA", minval = 1, group = grpT)
+stFactor    = input.float(3.0, "Supertrend Factor", minval = 0.1, step = 0.1, group = grpT)
+stAtrLen    = input.int(10, "Supertrend ATR Length", minval = 1, group = grpT)
+useHtf      = input.bool(true, "Use Higher-Timeframe Filter", group = grpT)
+htfTf       = input.timeframe("15", "HTF Timeframe (15m works for 1m and 5m)", group = grpT)
+htfEmaLen   = input.int(50, "HTF EMA Length", minval = 1, group = grpT)
+
+grpM = "Momentum & Filters"
+rsiLen       = input.int(14, "RSI Length", minval = 1, group = grpM)
+rsiLongMin   = input.float(50, "RSI Long Min", group = grpM)
+rsiLongMax   = input.float(72, "RSI Long Max (avoid overbought)", group = grpM)
+rsiShortMax  = input.float(50, "RSI Short Max", group = grpM)
+rsiShortMin  = input.float(28, "RSI Short Min (avoid oversold)", group = grpM)
+adxLen       = input.int(14, "ADX Length", minval = 1, group = grpM)
+adxMin       = input.float(22, "ADX Minimum (trend strength)", group = grpM)
+pullbackBars = input.int(5, "Pullback Lookback (bars)", minval = 1, group = grpM)
+useVol       = input.bool(true, "Use (Tick) Volume Filter", group = grpM)
+volLen       = input.int(20, "Volume MA Length", minval = 1, group = grpM)
+volMult      = input.float(1.0, "Volume > MA x", minval = 0, step = 0.1, group = grpM)
+cooldown     = input.int(3, "Cooldown Bars After Exit", minval = 0, group = grpM)
+
+grpS = "Session (gold moves in London / New York)"
+useSession = input.bool(true, "Trade Only Inside Session", group = grpS)
+sessionStr = input.session("0700-1700", "Session", group = grpS)
+sessionTz  = input.string("UTC", "Session Timezone", group = grpS)
+
+grpR = "Exits (ATR multiples)"
+atrLen     = input.int(14, "ATR Length", minval = 1, group = grpR)
+slMult     = input.float(1.5, "Stop Loss x ATR", minval = 0.1, step = 0.1, group = grpR)
+minSlUsd   = input.float(1.0, "Minimum Stop Distance (USD per oz)", minval = 0, step = 0.1, group = grpR)
+tp1Mult    = input.float(1.0, "TP1 x ATR (partial close)", minval = 0.1, step = 0.1, group = grpR)
+tp2Mult    = input.float(2.5, "TP2 x ATR (rest)", minval = 0.1, step = 0.1, group = grpR)
+tp1Pct     = input.int(50, "TP1 Close %", minval = 1, maxval = 100, group = grpR)
+useBE      = input.bool(true, "Move Stop to Break-Even After TP1", group = grpR)
+useTrail   = input.bool(true, "ATR Trailing Stop After TP1", group = grpR)
+trailMult  = input.float(2.0, "Trail x ATR", minval = 0.1, step = 0.1, group = grpR)
+useStFlip  = input.bool(true, "Exit on Supertrend Flip", group = grpR)
+
+grpA = "Account & Position Size"
+riskPct       = input.float(5.0, "Risk per Trade % (aggressive)", minval = 0.1, step = 0.5, group = grpA)
+minLotOz      = input.float(1.0, "Broker Minimum Size (oz)  1 = 0.01 lot std, 0.01 = cent", minval = 0.0001, group = grpA)
+lotStepOz     = input.float(1.0, "Broker Size Step (oz)", minval = 0.0001, group = grpA)
+maxRiskPct    = input.float(12.0, "Skip Trade if Min Size Risks More Than %", minval = 0.1, group = grpA)
+maxDailyLoss  = input.float(20.0, "Daily Loss Limit % (stop trading for the day)", minval = 0.1, group = grpA)
+maxTradesDay  = input.int(8, "Max Trades per Day", minval = 1, group = grpA)
+
+grpV = "Visuals"
+showDash   = input.bool(true, "Show Stats Panel", group = grpV)
+showLevels = input.bool(true, "Show SL / TP Lines", group = grpV)
+
+// ── Calculations ────────────────────────────────────────────────────────────
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)
+rsi = ta.rsi(close, rsiLen)
+[macdLine, sigLine, hist] = ta.macd(close, 12, 26, 9)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+atr = ta.atr(atrLen)
+// Widen the ATR unit when the market is too quiet, so SL >= minSlUsd and TPs scale with it
+effAtr = math.max(atr, minSlUsd / slMult)
+volSma = ta.sma(volume, volLen)
+histUp = ta.crossover(hist, 0)
+histDn = ta.crossunder(hist, 0)
+barsSinceTouchL = ta.barssince(low <= emaSlow)
+barsSinceTouchS = ta.barssince(high >= emaSlow)
+
+// Higher timeframe trend, previous confirmed HTF bar => no repaint
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead = barmerge.lookahead_on)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
+htfUp = not useHtf or htfClose > htfEma
+htfDn = not useHtf or htfClose < htfEma
+
+hasVol = not na(volume) and volume > 0
+volOk  = not useVol or not hasVol or volume > volSma * volMult
+inSession = not useSession or not na(time(timeframe.period, sessionStr, sessionTz))
+
+trendUp = close > emaTrend and emaFast > emaSlow and stDir < 0 and htfUp
+trendDn = close < emaTrend and emaFast < emaSlow and stDir > 0 and htfDn
+strongUp = adx > adxMin and diPlus > diMinus
+strongDn = adx > adxMin and diMinus > diPlus
+pulledBackL = nz(barsSinceTouchL, 9999) <= pullbackBars
+pulledBackS = nz(barsSinceTouchS, 9999) <= pullbackBars
+trigL = close > emaFast and close > open and (close > high[1] or histUp)
+trigS = close < emaFast and close < open and (close < low[1] or histDn)
+rsiL = rsi > rsiLongMin and rsi < rsiLongMax
+rsiS = rsi < rsiShortMax and rsi > rsiShortMin
+
+// ── Account guards ──────────────────────────────────────────────────────────
+var int lastExitBar = -100000
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastExitBar := bar_index
+cooldownOk = bar_index - lastExitBar > cooldown
+
+newDay = ta.change(time("D")) != 0
+var float dayStartEq = strategy.initial_capital
+var int dayTrades = 0
+if newDay
+    dayStartEq := strategy.equity
+    dayTrades := 0
+dayLossPct = dayStartEq > 0 ? (dayStartEq - strategy.equity) / dayStartEq * 100 : 0.0
+dayOk = dayLossPct < maxDailyLoss and dayTrades < maxTradesDay
+
+// Position size: risk % of equity / stop distance, rounded down to the broker step
+slDist  = effAtr * slMult
+rawQty  = strategy.equity * riskPct / 100 / (slDist * syminfo.pointvalue)
+stepQty = math.floor(rawQty / lotStepOz) * lotStepOz
+tradeQty = math.max(stepQty, minLotOz)
+tradeRiskPct = strategy.equity > 0 ? tradeQty * slDist * syminfo.pointvalue / strategy.equity * 100 : 100.0
+sizeOk = tradeRiskPct <= maxRiskPct
+
+allowLong  = tradeDir != "Short Only"
+allowShort = tradeDir != "Long Only"
+isFlat = strategy.position_size == 0
+baseOk = isFlat and cooldownOk and inSession and dayOk and sizeOk and volOk and barstate.isconfirmed
+
+longSig  = allowLong and baseOk and trendUp and strongUp and pulledBackL and trigL and rsiL
+shortSig = allowShort and baseOk and trendDn and strongDn and pulledBackS and trigS and rsiS
+
+// Setup was valid but the minimum lot would risk too much => shown as a grey marker
+skippedSig = not sizeOk and isFlat and cooldownOk and inSession and dayOk and volOk and barstate.isconfirmed and ((allowLong and trendUp and strongUp and pulledBackL and trigL and rsiL) or (allowShort and trendDn and strongDn and pulledBackS and trigS and rsiS))
+
+// ── Trade management ────────────────────────────────────────────────────────
+var float entryPx = na
+var float slPx    = na
+var float tp1Px   = na
+var float tp2Px   = na
+var float sigAtr  = na
+var float lastQty = na
+var bool  tp1Done = false
+
+setLevels(float basePx, bool isLong) =>
+    dir = isLong ? 1.0 : -1.0
+    [basePx - dir * sigAtr * slMult, basePx + dir * sigAtr * tp1Mult, basePx + dir * sigAtr * tp2Mult]
+
+lotText(float qty) =>
+    str.tostring(qty / 100, "#.####") + " lot (" + str.tostring(qty, "#.####") + " oz)"
+
+if longSig
+    sigAtr  := effAtr
+    entryPx := close
+    lastQty := tradeQty
+    [s, t1, t2] = setLevels(close, true)
+    slPx := s, tp1Px := t1, tp2Px := t2
+    tp1Done := false
+    dayTrades += 1
+    strategy.entry("Long", strategy.long, qty = tradeQty)
+    alert("XAU BUY @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick), alert.freq_once_per_bar_close)
+
+if shortSig
+    sigAtr  := effAtr
+    entryPx := close
+    lastQty := tradeQty
+    [s, t1, t2] = setLevels(close, false)
+    slPx := s, tp1Px := t1, tp2Px := t2
+    tp1Done := false
+    dayTrades += 1
+    strategy.entry("Short", strategy.short, qty = tradeQty)
+    alert("XAU SELL @ " + str.tostring(close, format.mintick) + " | " + lotText(tradeQty) + " | SL " + str.tostring(slPx, format.mintick) + " | TP1 " + str.tostring(tp1Px, format.mintick) + " | TP2 " + str.tostring(tp2Px, format.mintick), alert.freq_once_per_bar_close)
+
+// Re-anchor levels to the real fill price on the bar the position opens
+newLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+if newLong or newShort
+    entryPx := strategy.position_avg_price
+    [s, t1, t2] = setLevels(entryPx, newLong)
+    slPx := s, tp1Px := t1, tp2Px := t2
+
+// TP1 reached => break-even + trailing
+if strategy.position_size > 0
+    if not tp1Done and (high >= tp1Px or strategy.position_size < strategy.position_size[1])
+        tp1Done := true
+    if tp1Done
+        if useBE
+            slPx := math.max(slPx, entryPx)
+        if useTrail
+            slPx := math.max(slPx, close - effAtr * trailMult)
+    if useStFlip and stDir > 0
+        strategy.close("Long", comment = "ST flip")
+
+if strategy.position_size < 0
+    if not tp1Done and (low <= tp1Px or strategy.position_size > strategy.position_size[1])
+        tp1Done := true
+    if tp1Done
+        if useBE
+            slPx := math.min(slPx, entryPx)
+        if useTrail
+            slPx := math.min(slPx, close + effAtr * trailMult)
+    if useStFlip and stDir < 0
+        strategy.close("Short", comment = "ST flip")
+
+// A partial close smaller than the broker minimum is not possible, so with
+// 1 x minimum size the whole position exits at TP1.
+canSplit = nz(lastQty) >= 2 * minLotOz
+tp1QtyPct = canSplit ? tp1Pct : 100
+
+// Exit orders (re-sent each bar so the stop follows slPx)
+if strategy.position_size > 0 or longSig
+    if not tp1Done
+        strategy.exit("L-TP1", "Long", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = "TP1", comment_loss = "SL")
+    strategy.exit("L-TP2", "Long", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
+
+if strategy.position_size < 0 or shortSig
+    if not tp1Done
+        strategy.exit("S-TP1", "Short", qty_percent = tp1QtyPct, limit = tp1Px, stop = slPx, comment_profit = "TP1", comment_loss = "SL")
+    strategy.exit("S-TP2", "Short", limit = tp2Px, stop = slPx, comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(emaFast, "Fast EMA", color = color.new(color.aqua, 0), linewidth = 1)
+plot(emaSlow, "Slow EMA", color = color.new(color.orange, 0), linewidth = 1)
+plot(emaTrend, "Trend EMA", color = color.new(color.gray, 0), linewidth = 2)
+plot(stLine, "Supertrend", color = stDir < 0 ? color.new(color.lime, 30) : color.new(color.red, 30), style = plot.style_linebr)
+
+inPos = strategy.position_size != 0
+plot(showLevels and inPos ? slPx : na, "Stop", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and inPos and not tp1Done ? tp1Px : na, "TP1", color = color.new(color.green, 30), style = plot.style_linebr)
+plot(showLevels and inPos ? tp2Px : na, "TP2", color = color.green, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and inPos ? entryPx : na, "Entry", color = color.new(color.white, 40), style = plot.style_linebr)
+
+plotshape(longSig, "BUY", shape.labelup, location.belowbar, color.new(color.lime, 0), text = "BUY", textcolor = color.black, size = size.small)
+plotshape(shortSig, "SELL", shape.labeldown, location.abovebar, color.new(color.red, 0), text = "SELL", textcolor = color.white, size = size.small)
+plotshape(skippedSig, "Skipped (risk too high)", shape.xcross, location.abovebar, color.new(color.gray, 0), size = size.tiny)
+bgcolor(not inSession ? color.new(color.gray, 92) : trendUp ? color.new(color.green, 93) : trendDn ? color.new(color.red, 93) : na, title = "Trend / Session Background")
+
+// ── Stats panel ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 20), border_width = 1)
+if showDash and barstate.islast
+    closed = strategy.closedtrades
+    winRate = closed > 0 ? float(strategy.wintrades) / closed * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    wrColor = winRate >= 65 ? color.lime : winRate >= 50 ? color.yellow : color.red
+    table.cell(dash, 0, 0, "XAU Aggressive Scalper", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, "", text_color = color.white)
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 1, "Win Rate", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(winRate, "#.0") + "%", text_color = wrColor, text_size = size.small)
+    table.cell(dash, 0, 2, "Closed Trades", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(closed), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "Profit Factor", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(pf, "#.00"), text_color = pf >= 1.3 ? color.lime : color.orange, text_size = size.small)
+    table.cell(dash, 0, 4, "Equity", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(strategy.equity, "#.##") + " USD", text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dash, 0, 5, "Max Drawdown", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(strategy.max_drawdown, "#.##") + " USD", text_color = color.orange, text_size = size.small)
+    table.cell(dash, 0, 6, "Next Size", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 6, lotText(tradeQty), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 7, "Risk if SL Hit", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 7, str.tostring(tradeRiskPct, "#.0") + "%" + (sizeOk ? "" : " (SKIP)"), text_color = sizeOk ? color.white : color.red, text_size = size.small)
+    table.cell(dash, 0, 8, "Stop Distance", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 8, str.tostring(slDist, "#.00") + " USD/oz", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 9, "Trend / Session", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 9, (trendUp ? "BULL" : trendDn ? "BEAR" : "NEUTRAL") + (inSession ? " / OPEN" : " / CLOSED"), text_color = trendUp ? color.lime : trendDn ? color.red : color.gray, text_size = size.small)
