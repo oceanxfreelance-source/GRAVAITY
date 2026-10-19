@@ -11,7 +11,9 @@
 //|    (or MACD histogram crosses zero)                              |
 //|  - RSI 50-72 for buys, 28-50 for sells, tick volume > average    |
 //|  - London / New York session only (07:00-17:00 UTC)              |
-//|  - Fixed stop / target in price (USD per oz): SL 4.0, TP 2.0     |
+//|  - Exit profiles (price distance, USD per oz):                    |
+//|      Big profit (default): SL 4, TP 6, break-even at +2.5        |
+//|      High win rate: SL 4, TP 2      Big reward: SL 4, TP 8       |
 //|  - Lot size from % risk of equity, rounded to the broker's step  |
 //|  - Optional martingale (x2 after a loss, max 2 steps)            |
 //|  - Daily loss limit and max trades per day                       |
@@ -27,6 +29,14 @@
 #property description "XAUUSD M5 trend-pullback scalper with fixed SL/TP, risk sizing and optional martingale."
 
 #include <Trade\Trade.mqh>
+
+enum ENUM_EXIT_PROFILE
+  {
+   PROFILE_BIG_PROFIT  = 0, // Big profit: SL 4 / TP 6, break-even at +2.5
+   PROFILE_HIGH_WIN    = 1, // High win rate: SL 4 / TP 2
+   PROFILE_BIG_RR      = 2, // Big reward: SL 4 / TP 8 (low win rate)
+   PROFILE_CUSTOM      = 3  // Custom: use the values below
+  };
 
 enum ENUM_TRADE_DIR
   {
@@ -76,10 +86,11 @@ input int             InpTesterGmtOffset = 2;      // Broker server GMT offset (
 
 //--- Exits
 input group "Exits (price distance, USD per oz)"
-input double          InpSlUsd       = 4.0;        // Stop loss
-input double          InpTpUsd       = 2.0;        // Take profit
-input bool            InpUseBE       = false;      // Break-even stop
-input double          InpBeTrigUsd   = 0.8;        // Break-even trigger
+input ENUM_EXIT_PROFILE InpProfile   = PROFILE_BIG_PROFIT; // Exit profile
+input double          InpSlUsd       = 4.0;        // Custom: stop loss
+input double          InpTpUsd       = 6.0;        // Custom: take profit
+input bool            InpUseBE       = true;       // Custom: break-even stop
+input double          InpBeTrigUsd   = 2.5;        // Custom: break-even trigger
 input double          InpBeLockUsd   = 0.4;        // Break-even lock (covers spread)
 input bool            InpExitStFlip  = true;       // Close on Supertrend flip
 
@@ -104,6 +115,8 @@ input bool            InpShowPanel   = true;       // Show info panel
 
 //--- globals
 CTrade   trade;
+double   gSl, gTp, gBeTrig;   // effective exit settings from the profile
+bool     gUseBE;
 int      hEmaF = INVALID_HANDLE, hEmaS = INVALID_HANDLE, hEmaT = INVALID_HANDLE;
 int      hEma12 = INVALID_HANDLE, hEma26 = INVALID_HANDLE;
 int      hRsi = INVALID_HANDLE, hAdx = INVALID_HANDLE, hHtfEma = INVALID_HANDLE;
@@ -140,6 +153,14 @@ int OnInit()
      }
    if(PeriodSeconds(InpHtfTF) < PeriodSeconds(InpTF))
       Print("Warning: HTF timeframe is lower than the signal timeframe");
+
+   switch(InpProfile)
+     {
+      case PROFILE_BIG_PROFIT: gSl = 4.0; gTp = 6.0; gUseBE = true;  gBeTrig = 2.5; break;
+      case PROFILE_HIGH_WIN:   gSl = 4.0; gTp = 2.0; gUseBE = false; gBeTrig = 0.8; break;
+      case PROFILE_BIG_RR:     gSl = 4.0; gTp = 8.0; gUseBE = false; gBeTrig = 2.5; break;
+      default:                 gSl = InpSlUsd; gTp = InpTpUsd; gUseBE = InpUseBE; gBeTrig = InpBeTrigUsd;
+     }
 
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetTypeFillingBySymbol(_Symbol);
@@ -402,7 +423,7 @@ bool CalcLots(double &lots, double &riskPct)
   {
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double lpl = LossPerLot(InpSlUsd + spread);
+   double lpl = LossPerLot(gSl + spread);
    if(eq <= 0 || lpl <= 0)
       return false;
 
@@ -448,8 +469,8 @@ void OpenTrade(bool isLong, double lots, double riskPct)
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double minDist = (SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) + 2) * _Point;
-   double slD = MathMax(InpSlUsd, minDist);
-   double tpD = MathMax(InpTpUsd, minDist);
+   double slD = MathMax(gSl, minDist);
+   double tpD = MathMax(gTp, minDist);
    string cmt = StringFormat("XAUS %s M%d", isLong ? "BUY" : "SELL", martLevel);
    bool ok;
    if(isLong)
@@ -488,15 +509,15 @@ void ManagePosition(ulong ticket, const MqlRates &bar, int stDir)
       return;
      }
 
-   if(InpUseBE)
+   if(gUseBE)
      {
-      if(type == POSITION_TYPE_BUY && bar.high >= open + InpBeTrigUsd)
+      if(type == POSITION_TYPE_BUY && bar.high >= open + gBeTrig)
         {
          double nsl = NormalizeDouble(open + InpBeLockUsd, _Digits);
          if(nsl > sl && nsl < SymbolInfoDouble(_Symbol, SYMBOL_BID))
             trade.PositionModify(ticket, nsl, tp);
         }
-      if(type == POSITION_TYPE_SELL && bar.low <= open - InpBeTrigUsd)
+      if(type == POSITION_TYPE_SELL && bar.low <= open - gBeTrig)
         {
          double nsl = NormalizeDouble(open - InpBeLockUsd, _Digits);
          if((sl == 0 || nsl < sl) && nsl > SymbolInfoDouble(_Symbol, SYMBOL_ASK))
@@ -634,7 +655,7 @@ void DrawPanel()
    s += StringFormat("Today: %d / %d trades   P/L %+.1f%%\n", dayTrades, InpMaxTradesDay, dayPl);
    s += StringFormat("Martingale: %s\n", InpUseMart ? StringFormat("step %d / %d (x%.2f)", martLevel, InpMartSteps, MathPow(InpMartMult, martLevel)) : "OFF");
    s += StringFormat("Trend %s   Session %s   ADX %.1f\n", panelTrend, panelSession, panelAdx);
-   s += StringFormat("SL %.2f / TP %.2f (price)   Risk %.1f%%\n", InpSlUsd, InpTpUsd, InpRiskPct);
+   s += StringFormat("SL %.2f / TP %.2f (price)  BE %s   Risk %.1f%%\n", gSl, gTp, gUseBE ? "on" : "off", InpRiskPct);
    if(panelNote != "")
       s += panelNote + "\n";
    Comment(s);
